@@ -126,6 +126,15 @@ impl ReplicationManager {
         // Replicate to followers
         self.replicate_to_followers().await?;
         
+        // Auto-commit in single-node clusters (no peers to replicate to)
+        if self.peers.is_empty() {
+            info!("Single-node cluster detected, auto-committing entry {}", entry_id);
+            self.storage.commit_up_to(entry_id)?;
+        } else {
+            // In multi-node clusters, check for majority and commit
+            self.update_commit_index()?;
+        }
+        
         Ok(true)
     }
 
@@ -464,6 +473,44 @@ impl ReplicationManager {
                                 self.next_index.insert(peer_addr, current_next - 1);
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update commit index based on majority replication
+    fn update_commit_index(&mut self) -> Result<()> {
+        if self.state != NodeState::Leader {
+            return Ok(());
+        }
+
+        let current_commit_index = self.storage.get_commit_index();
+        let last_log_index = self.storage.get_last_log_index();
+
+        // Find the highest index that has been replicated to majority
+        for n in (current_commit_index + 1)..=last_log_index {
+            let mut replicated_count = 1; // Count leader itself
+            
+            // Count how many followers have this entry
+            for match_index in self.match_index.values() {
+                if *match_index >= n {
+                    replicated_count += 1;
+                }
+            }
+
+            // Check if we have majority (more than half of total nodes)
+            let total_nodes = self.peers.len() + 1; // +1 for leader
+            let majority = (total_nodes / 2) + 1;
+
+            if replicated_count >= majority {
+                // Ensure the entry is from current term before committing
+                if let Some(entry) = self.storage.get(n) {
+                    if entry.term == self.current_term {
+                        info!("Committing entries up to index {} (majority: {}/{})", n, replicated_count, total_nodes);
+                        self.storage.commit_up_to(n)?;
                     }
                 }
             }
